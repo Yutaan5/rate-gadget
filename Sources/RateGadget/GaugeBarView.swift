@@ -105,6 +105,51 @@ enum MenuBarIconRenderer {
     }
 }
 
+/// A "label + switch" row used inside the dropdown menu for the show/hide
+/// toggles. Uses a real NSSwitch so the on/off state is visually obvious, and
+/// keeps the menu open while flipping (view-based menu items don't dismiss).
+final class ToggleRowView: NSView {
+    private let toggle = NSSwitch()
+    var onChange: ((Bool) -> Void)?
+
+    init(title: String, isOn: Bool, width: CGFloat = 300, height: CGFloat = 28) {
+        super.init(frame: NSRect(x: 0, y: 0, width: width, height: height))
+
+        let label = NSTextField(labelWithString: title)
+        label.font = NSFont.systemFont(ofSize: 12)
+        label.sizeToFit()
+        label.frame.origin = NSPoint(x: 14, y: (height - label.frame.height) / 2)
+        addSubview(label)
+
+        toggle.state = isOn ? .on : .off
+        toggle.controlSize = .small
+        toggle.sizeToFit()
+        toggle.frame.origin = NSPoint(x: width - toggle.frame.width - 14, y: (height - toggle.frame.height) / 2)
+        toggle.target = self
+        toggle.action = #selector(switchChanged)
+        addSubview(toggle)
+    }
+
+    required init?(coder: NSCoder) {
+        fatalError("init(coder:) has not been implemented")
+    }
+
+    @objc private func switchChanged() {
+        onChange?(toggle.state == .on)
+    }
+
+    // Let a click anywhere on the row flip the switch, not just the knob.
+    override func mouseDown(with event: NSEvent) {
+        let location = convert(event.locationInWindow, from: nil)
+        if !toggle.frame.contains(location) {
+            toggle.state = toggle.state == .on ? .off : .on
+            switchChanged()
+        } else {
+            super.mouseDown(with: event)
+        }
+    }
+}
+
 /// A single "label — bar — percent — note" row used inside the dropdown menu.
 final class DetailRowView: NSView {
     struct Content {

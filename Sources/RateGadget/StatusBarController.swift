@@ -5,8 +5,9 @@ import ServiceManagement
 /// menu bar icon and the dropdown detail menu. Each source (Claude / Codex)
 /// can be hidden via the menu; a hidden source is fully stopped, not just
 /// undrawn, so Claude-only users never spawn a codex subprocess.
-final class StatusBarController: NSObject {
+final class StatusBarController: NSObject, NSMenuDelegate {
     private let statusItem = NSStatusBar.system.statusItem(withLength: 50)
+    private let menu = NSMenu()
     private let codexPoller = CodexRateLimitPoller()
     private let claudeWatcher = ClaudeRateLimitWatcher()
 
@@ -18,18 +19,21 @@ final class StatusBarController: NSObject {
     override init() {
         super.init()
 
+        menu.delegate = self
+        statusItem.menu = menu
+
         codexPoller.onUpdate = { [weak self] snapshot in
             self?.codexSnapshot = snapshot
             self?.codexErrorMessage = nil
-            self?.refresh()
+            self?.refreshIcon()
         }
         codexPoller.onError = { [weak self] message in
             self?.codexErrorMessage = message
-            self?.refresh()
+            self?.refreshIcon()
         }
         claudeWatcher.onUpdate = { [weak self] snapshot in
             self?.claudeSnapshot = snapshot
-            self?.refresh()
+            self?.refreshIcon()
         }
 
         if Preferences.showClaude {
@@ -38,7 +42,7 @@ final class StatusBarController: NSObject {
         if Preferences.showCodex {
             codexPoller.start()
         }
-        refresh()
+        refreshIcon()
     }
 
     private func startClaude() {
@@ -48,7 +52,7 @@ final class StatusBarController: NSObject {
         claudeWatcher.start()
     }
 
-    private func refresh() {
+    private func refreshIcon() {
         var entries: [MenuBarIconRenderer.Entry] = []
         if Preferences.showClaude {
             entries.append(.init(label: "C", window: claudeSnapshot?.headline))
@@ -58,11 +62,16 @@ final class StatusBarController: NSObject {
         }
         statusItem.length = MenuBarIconRenderer.iconWidth(entryCount: entries.count) + 4
         statusItem.button?.image = MenuBarIconRenderer.render(entries: entries)
-        statusItem.menu = buildMenu()
     }
 
-    private func buildMenu() -> NSMenu {
-        let menu = NSMenu()
+    /// Rebuilds the menu contents each time it is about to open, so the data
+    /// rows are always current without touching the menu while it's tracking.
+    func menuNeedsUpdate(_ menu: NSMenu) {
+        menu.removeAllItems()
+        buildMenu(into: menu)
+    }
+
+    private func buildMenu(into menu: NSMenu) {
 
         if Preferences.showClaude {
             menu.addItem(sectionHeader("Claude"))
@@ -120,14 +129,20 @@ final class StatusBarController: NSObject {
             menu.addItem(.separator())
         }
 
-        let claudeToggle = NSMenuItem(title: "Claude を表示", action: #selector(toggleClaude), keyEquivalent: "")
-        claudeToggle.target = self
-        claudeToggle.state = Preferences.showClaude ? .on : .off
+        let claudeToggleView = ToggleRowView(title: "Claude を表示", isOn: Preferences.showClaude)
+        claudeToggleView.onChange = { [weak self] isOn in
+            self?.setClaudeVisible(isOn)
+        }
+        let claudeToggle = NSMenuItem()
+        claudeToggle.view = claudeToggleView
         menu.addItem(claudeToggle)
 
-        let codexToggle = NSMenuItem(title: "Codex を表示", action: #selector(toggleCodex), keyEquivalent: "")
-        codexToggle.target = self
-        codexToggle.state = Preferences.showCodex ? .on : .off
+        let codexToggleView = ToggleRowView(title: "Codex を表示", isOn: Preferences.showCodex)
+        codexToggleView.onChange = { [weak self] isOn in
+            self?.setCodexVisible(isOn)
+        }
+        let codexToggle = NSMenuItem()
+        codexToggle.view = codexToggleView
         menu.addItem(codexToggle)
 
         menu.addItem(.separator())
@@ -148,8 +163,6 @@ final class StatusBarController: NSObject {
         let quitItem = NSMenuItem(title: "終了", action: #selector(quit), keyEquivalent: "q")
         quitItem.target = self
         menu.addItem(quitItem)
-
-        return menu
     }
 
     private func sectionHeader(_ title: String) -> NSMenuItem {
@@ -182,28 +195,30 @@ final class StatusBarController: NSObject {
         return item
     }
 
-    @objc private func toggleClaude() {
-        Preferences.showClaude.toggle()
-        if Preferences.showClaude {
+    private func setClaudeVisible(_ visible: Bool) {
+        Preferences.showClaude = visible
+        if visible {
             startClaude()
         } else {
             claudeWatcher.stop()
             claudeSnapshot = nil
             statusLineMessage = nil
         }
-        refresh()
+        // Only the icon updates immediately; the open menu's data sections
+        // reflect the change the next time it opens (menuNeedsUpdate).
+        refreshIcon()
     }
 
-    @objc private func toggleCodex() {
-        Preferences.showCodex.toggle()
-        if Preferences.showCodex {
+    private func setCodexVisible(_ visible: Bool) {
+        Preferences.showCodex = visible
+        if visible {
             codexPoller.start()
         } else {
             codexPoller.stop()
             codexSnapshot = nil
             codexErrorMessage = nil
         }
-        refresh()
+        refreshIcon()
     }
 
     @objc private func refreshCodex() {
@@ -224,7 +239,6 @@ final class StatusBarController: NSObject {
         } catch {
             NSLog("[RateGadget] login item toggle failed: %@", error.localizedDescription)
         }
-        refresh()
     }
 
     @objc private func quit() {

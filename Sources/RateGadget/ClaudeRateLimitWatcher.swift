@@ -23,22 +23,21 @@ final class ClaudeRateLimitWatcher {
 
     func stop() {
         queue.async { [weak self] in
+            // The source's cancel handler owns closing the descriptor.
             self?.source?.cancel()
             self?.source = nil
+            self?.fileDescriptor = -1
             self?.fallbackTimer?.cancel()
             self?.fallbackTimer = nil
-            if let fd = self?.fileDescriptor, fd >= 0 {
-                close(fd)
-            }
-            self?.fileDescriptor = -1
         }
     }
 
     private func watchFile() {
+        // Cancelling triggers the old source's cancel handler, which closes the
+        // fd it captured — never close inline here or we'd double-close.
         source?.cancel()
-        if fileDescriptor >= 0 {
-            close(fileDescriptor)
-        }
+        source = nil
+        fileDescriptor = -1
 
         let fd = open(fileURL.path, O_EVTONLY)
         guard fd >= 0 else {
@@ -59,10 +58,10 @@ final class ClaudeRateLimitWatcher {
             // re-open so future writes are still observed.
             self?.watchFile()
         }
-        newSource.setCancelHandler { [weak self] in
-            if let fd = self?.fileDescriptor, fd >= 0 {
-                close(fd)
-            }
+        newSource.setCancelHandler {
+            // Capture the fd by value: by the time this runs, self.fileDescriptor
+            // may already refer to a newer descriptor.
+            close(fd)
         }
         newSource.resume()
         source = newSource

@@ -31,11 +31,18 @@ final class CodexRateLimitPoller {
 
     func stop() {
         queue.async { [weak self] in
-            self?.isStopped = true
-            self?.pollTimer?.cancel()
-            self?.pollTimer = nil
-            self?.process?.terminate()
-            self?.process = nil
+            guard let self else { return }
+            self.isStopped = true
+            self.pollTimer?.cancel()
+            self.pollTimer = nil
+            self.process?.terminate()
+            self.process = nil
+            self.stdinHandle = nil
+            self.stdoutBuffer.removeAll()
+            for (_, completion) in self.pendingRequests {
+                completion(.failure(PollerError.processExited))
+            }
+            self.pendingRequests.removeAll()
         }
     }
 
@@ -49,6 +56,12 @@ final class CodexRateLimitPoller {
     // MARK: - Process lifecycle
 
     private func launchProcess() {
+        // Any requests still pending belong to a previous process instance.
+        for (_, completion) in pendingRequests {
+            completion(.failure(PollerError.processExited))
+        }
+        pendingRequests.removeAll()
+
         let process = Process()
         process.executableURL = URL(fileURLWithPath: "/bin/zsh")
         // Run through a login shell so version managers (nodenv/nvm/etc.) resolve
@@ -62,14 +75,17 @@ final class CodexRateLimitPoller {
         process.standardOutput = stdout
         process.standardError = stderr
 
-        stdout.fileHandleForReading.readabilityHandler = { [weak self] handle in
+        stdout.fileHandleForReading.readabilityHandler = { [weak self, weak process] handle in
             let data = handle.availableData
             guard !data.isEmpty else { return }
-            self?.queue.async { self?.consumeStdout(data) }
+            self?.queue.async {
+                guard let self, let process, self.process === process else { return }
+                self.consumeStdout(data)
+            }
         }
 
-        process.terminationHandler = { [weak self] _ in
-            self?.queue.async { self?.handleTermination() }
+        process.terminationHandler = { [weak self] proc in
+            self?.queue.async { self?.handleTermination(of: proc) }
         }
 
         do {
@@ -89,7 +105,10 @@ final class CodexRateLimitPoller {
         schedulePolling()
     }
 
-    private func handleTermination() {
+    private func handleTermination(of proc: Process) {
+        // A stale handler from a process replaced by stop()/start() must not
+        // tear down the current one (or double-restart).
+        guard proc === process else { return }
         stdoutBuffer.removeAll()
         stdinHandle = nil
         process = nil

@@ -45,41 +45,175 @@ final class GaugeBarView: NSView {
     }
 }
 
-/// Renders the always-visible menu bar icon: two thin gauge bars (Claude on
-/// top, Codex below), each preceded by a single-letter label.
+/// Renders the always-visible menu bar icon. Layout adapts to which sources
+/// are visible: two stacked bars (Claude on top, Codex below), a single
+/// centered bar, or a fallback glyph when both are hidden.
 enum MenuBarIconRenderer {
-    static func render(claude: RateWindow?, codex: RateWindow?) -> NSImage {
-        let size = NSSize(width: 46, height: 18)
+    struct Entry {
+        var label: String
+        var window: RateWindow?
+    }
+
+    static func iconWidth(entryCount: Int) -> CGFloat {
+        entryCount == 0 ? 24 : 46
+    }
+
+    static func render(entries: [Entry]) -> NSImage {
+        let size = NSSize(width: iconWidth(entryCount: entries.count), height: 18)
         let image = NSImage(size: size, flipped: false) { rect in
+            guard !entries.isEmpty else {
+                let attrs: [NSAttributedString.Key: Any] = [
+                    .font: NSFont.systemFont(ofSize: 11, weight: .semibold),
+                    .foregroundColor: NSColor.labelColor,
+                ]
+                let text = "RG" as NSString
+                let textSize = text.size(withAttributes: attrs)
+                text.draw(
+                    at: NSPoint(x: (rect.width - textSize.width) / 2, y: (rect.height - textSize.height) / 2),
+                    withAttributes: attrs
+                )
+                return true
+            }
+
             let labelAttrs: [NSAttributedString.Key: Any] = [
                 .font: NSFont.systemFont(ofSize: 8, weight: .semibold),
                 .foregroundColor: NSColor.labelColor,
             ]
             let barX: CGFloat = 12
             let barWidth = rect.width - barX - 2
+            let rowHeight: CGFloat = 8
 
-            let topBarRect = NSRect(x: barX, y: rect.height - 8, width: barWidth, height: 6)
-            ("C" as NSString).draw(at: NSPoint(x: 0, y: rect.height - 9), withAttributes: labelAttrs)
-            drawGaugeBar(
-                in: topBarRect,
-                usedPercent: claude?.usedPercent,
-                severity: claude?.severity ?? .ok,
-                trackColor: NSColor.tertiaryLabelColor
-            )
-
-            let bottomBarRect = NSRect(x: barX, y: 2, width: barWidth, height: 6)
-            ("X" as NSString).draw(at: NSPoint(x: 0, y: 1), withAttributes: labelAttrs)
-            drawGaugeBar(
-                in: bottomBarRect,
-                usedPercent: codex?.usedPercent,
-                severity: codex?.severity ?? .ok,
-                trackColor: NSColor.tertiaryLabelColor
-            )
-
+            for (index, entry) in entries.enumerated() {
+                let y: CGFloat
+                if entries.count == 1 {
+                    y = (rect.height - rowHeight) / 2 + 1
+                } else {
+                    y = index == 0 ? rect.height - rowHeight : 2
+                }
+                (entry.label as NSString).draw(at: NSPoint(x: 0, y: y - 1), withAttributes: labelAttrs)
+                drawGaugeBar(
+                    in: NSRect(x: barX, y: y, width: barWidth, height: 6),
+                    usedPercent: entry.window?.usedPercent,
+                    severity: entry.window?.severity ?? .ok,
+                    trackColor: NSColor.tertiaryLabelColor
+                )
+            }
             return true
         }
         image.isTemplate = false
         return image
+    }
+}
+
+/// A "label + switch" row used inside the dropdown menu for the show/hide
+/// toggles. The switch is drawn by hand: an NSSwitch inside a menu renders in
+/// the inactive (gray) appearance, so its on-state accent color never shows.
+/// Custom drawing keeps the ON state clearly colored. Clicking anywhere on the
+/// row flips it, and the menu stays open (view-based items don't dismiss).
+final class ToggleRowView: NSView {
+    private var isOn: Bool
+    var onChange: ((Bool) -> Void)?
+
+    private let pillSize = NSSize(width: 32, height: 18)
+
+    init(title: String, isOn: Bool, width: CGFloat = 300, height: CGFloat = 28) {
+        self.isOn = isOn
+        super.init(frame: NSRect(x: 0, y: 0, width: width, height: height))
+
+        let label = NSTextField(labelWithString: title)
+        label.font = NSFont.systemFont(ofSize: 12)
+        label.sizeToFit()
+        label.frame.origin = NSPoint(x: 14, y: (height - label.frame.height) / 2)
+        addSubview(label)
+    }
+
+    required init?(coder: NSCoder) {
+        fatalError("init(coder:) has not been implemented")
+    }
+
+    override func draw(_ dirtyRect: NSRect) {
+        super.draw(dirtyRect)
+
+        let pillRect = NSRect(
+            x: bounds.width - pillSize.width - 14,
+            y: (bounds.height - pillSize.height) / 2,
+            width: pillSize.width,
+            height: pillSize.height
+        )
+        let radius = pillSize.height / 2
+        let pillPath = NSBezierPath(roundedRect: pillRect, xRadius: radius, yRadius: radius)
+        (isOn ? NSColor.controlAccentColor : NSColor.tertiaryLabelColor).setFill()
+        pillPath.fill()
+
+        let knobDiameter = pillSize.height - 4
+        let knobX = isOn
+            ? pillRect.maxX - knobDiameter - 2
+            : pillRect.minX + 2
+        let knobRect = NSRect(
+            x: knobX,
+            y: pillRect.minY + 2,
+            width: knobDiameter,
+            height: knobDiameter
+        )
+        NSColor.white.setFill()
+        NSBezierPath(ovalIn: knobRect).fill()
+    }
+
+    // Act on mouseUp, not mouseDown: flipping restructures the open menu, and
+    // if rows shift while the button is still held, the subsequent mouseUp
+    // would land on (and activate) whatever item moved under the cursor —
+    // e.g. 終了. Swallow mouseDown so menu tracking doesn't act on it either.
+    override func mouseDown(with event: NSEvent) {}
+
+    override func mouseUp(with event: NSEvent) {
+        let location = convert(event.locationInWindow, from: nil)
+        guard bounds.contains(location) else { return }
+        isOn.toggle()
+        needsDisplay = true
+        onChange?(isOn)
+    }
+}
+
+/// A bold section header row ("Claude" / "Codex"), optionally with a small
+/// refresh button beside the title. Used instead of a plain disabled menu item
+/// so the header can host the button.
+final class SectionHeaderRowView: NSView {
+    var onRefresh: (() -> Void)?
+
+    init(title: String, showsRefresh: Bool, width: CGFloat = 300, height: CGFloat = 22) {
+        super.init(frame: NSRect(x: 0, y: 0, width: width, height: height))
+
+        let label = NSTextField(labelWithString: title)
+        label.font = NSFont.boldSystemFont(ofSize: 12)
+        label.sizeToFit()
+        label.frame.origin = NSPoint(x: 14, y: (height - label.frame.height) / 2)
+        addSubview(label)
+
+        guard showsRefresh else { return }
+        let image = NSImage(systemSymbolName: "arrow.clockwise", accessibilityDescription: "更新")
+            ?? NSImage(named: NSImage.refreshTemplateName)!
+        let button = NSButton(image: image, target: self, action: #selector(refreshClicked))
+        button.isBordered = false
+        button.bezelStyle = .regularSquare
+        button.imageScaling = .scaleProportionallyDown
+        button.contentTintColor = .secondaryLabelColor
+        button.toolTip = "今すぐ更新"
+        let side: CGFloat = 18
+        button.frame = NSRect(
+            x: label.frame.maxX + 8,
+            y: (height - side) / 2,
+            width: side,
+            height: side
+        )
+        addSubview(button)
+    }
+
+    required init?(coder: NSCoder) {
+        fatalError("init(coder:) has not been implemented")
+    }
+
+    @objc private func refreshClicked() {
+        onRefresh?()
     }
 }
 

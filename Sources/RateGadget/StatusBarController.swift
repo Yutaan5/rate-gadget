@@ -2,103 +2,199 @@ import AppKit
 import ServiceManagement
 
 /// Owns the NSStatusItem, the two data sources, and renders both the compact
-/// menu bar icon and the dropdown detail menu.
-final class StatusBarController: NSObject {
+/// menu bar icon and the dropdown detail menu. Each source (Claude / Codex)
+/// can be hidden via the menu; a hidden source is fully stopped, not just
+/// undrawn, so Claude-only users never spawn a codex subprocess.
+final class StatusBarController: NSObject, NSMenuDelegate {
     private let statusItem = NSStatusBar.system.statusItem(withLength: 50)
+    private let menu = NSMenu()
     private let codexPoller = CodexRateLimitPoller()
     private let claudeWatcher = ClaudeRateLimitWatcher()
 
     private var claudeSnapshot: ClaudeRateSnapshot?
     private var codexSnapshot: CodexRateSnapshot?
     private var codexErrorMessage: String?
+    private var statusLineMessage: String?
+
+    // Gauge rows of the currently built menu, kept so data arriving while the
+    // menu is open (e.g. after tapping the refresh button) updates in place.
+    private var claudeFiveRow: DetailRowView?
+    private var claudeSevenRow: DetailRowView?
+    private var codexPrimaryRow: DetailRowView?
+    private var codexSecondaryRow: DetailRowView?
+
+    private var menuIsOpen = false
+
+    /// Which optional pieces the currently built menu contains. When incoming
+    /// data changes one of these, an in-place row update isn't enough and the
+    /// open menu is rebuilt.
+    private struct MenuStructure: Equatable {
+        var showClaude: Bool
+        var showCodex: Bool
+        var claudeHasData: Bool
+        var codexHasSecondary: Bool
+        var codexHasPlan: Bool
+        var codexHasError: Bool
+        var hasStatusLineMessage: Bool
+    }
+    private var builtStructure: MenuStructure?
+
+    private func currentStructure() -> MenuStructure {
+        MenuStructure(
+            showClaude: Preferences.showClaude,
+            showCodex: Preferences.showCodex,
+            claudeHasData: claudeSnapshot != nil,
+            codexHasSecondary: codexSnapshot?.secondary != nil,
+            codexHasPlan: codexSnapshot?.planType != nil,
+            codexHasError: codexErrorMessage != nil,
+            hasStatusLineMessage: statusLineMessage != nil
+        )
+    }
 
     override init() {
         super.init()
 
-        statusItem.button?.image = MenuBarIconRenderer.render(claude: nil, codex: nil)
-        statusItem.button?.imagePosition = .imageOnly
+        // With autoenablesItems (the default), view-based items that carry no
+        // action get auto-disabled on menu.update(), and disabled items' views
+        // never receive mouse events — which silently kills the toggle rows
+        // and the refresh button. Manage enabled state explicitly instead.
+        menu.autoenablesItems = false
+        menu.delegate = self
+        statusItem.menu = menu
 
         codexPoller.onUpdate = { [weak self] snapshot in
             self?.codexSnapshot = snapshot
             self?.codexErrorMessage = nil
-            self?.refresh()
+            self?.refreshIcon()
+            self?.updateOpenMenuRows()
         }
         codexPoller.onError = { [weak self] message in
             self?.codexErrorMessage = message
-            self?.refresh()
+            self?.refreshIcon()
         }
         claudeWatcher.onUpdate = { [weak self] snapshot in
             self?.claudeSnapshot = snapshot
-            self?.refresh()
+            self?.refreshIcon()
+            self?.updateOpenMenuRows()
         }
 
+        if Preferences.showClaude {
+            startClaude()
+        }
+        if Preferences.showCodex {
+            codexPoller.start()
+        }
+        refreshIcon()
+    }
+
+    private func startClaude() {
         let installResult = StatusLineInstaller.ensureInstalled()
+        statusLineMessage = installResult.installed ? nil : installResult.message
         NSLog("[RateGadget] statusLine install: %@", installResult.message)
-
-        codexPoller.start()
         claudeWatcher.start()
-        refresh()
     }
 
-    private func refresh() {
-        statusItem.button?.image = MenuBarIconRenderer.render(
-            claude: claudeSnapshot?.headline,
-            codex: codexSnapshot?.headline
-        )
-        statusItem.menu = buildMenu()
+    private func refreshIcon() {
+        var entries: [MenuBarIconRenderer.Entry] = []
+        if Preferences.showClaude {
+            entries.append(.init(label: "C", window: claudeSnapshot?.headline))
+        }
+        if Preferences.showCodex {
+            entries.append(.init(label: "X", window: codexSnapshot?.headline))
+        }
+        statusItem.length = MenuBarIconRenderer.iconWidth(entryCount: entries.count) + 4
+        statusItem.button?.image = MenuBarIconRenderer.render(entries: entries)
     }
 
-    private func buildMenu() -> NSMenu {
-        let menu = NSMenu()
+    /// Rebuilds the menu contents each time it is about to open, so the data
+    /// rows are always current.
+    func menuNeedsUpdate(_ menu: NSMenu) {
+        rebuildMenuNow()
+    }
 
-        menu.addItem(sectionHeader("Claude"))
-        menu.addItem(rowItem(.init(
-            label: "5時間",
-            window: claudeSnapshot?.fiveHour,
-            note: formatResetsAt(claudeSnapshot?.fiveHour?.resetsAt)
-        )))
-        menu.addItem(rowItem(.init(
-            label: "週次",
-            window: claudeSnapshot?.sevenDay,
-            note: formatResetsAt(claudeSnapshot?.sevenDay?.resetsAt)
-        )))
-        if let snapshot = claudeSnapshot {
-            let staleness = formatStaleness(snapshot.stalenessInterval)
-            let text = snapshot.isStale
-                ? "⚠️ 最終更新 \(staleness)（セッション非アクティブ）"
-                : "最終更新 \(staleness)"
-            menu.addItem(infoItem(text))
-        } else {
-            menu.addItem(infoItem("まだデータがありません（claudeを開いて1往復送ると反映されます）"))
+    func menuWillOpen(_ menu: NSMenu) {
+        menuIsOpen = true
+    }
+
+    func menuDidClose(_ menu: NSMenu) {
+        menuIsOpen = false
+    }
+
+    /// NSMenu reflects item changes while open, so this also serves the
+    /// toggle rows: flipping a switch restructures the visible menu in place.
+    private func rebuildMenuNow() {
+        menu.removeAllItems()
+        buildMenu(into: menu)
+        builtStructure = currentStructure()
+    }
+
+    private func buildMenu(into menu: NSMenu) {
+        claudeFiveRow = nil
+        claudeSevenRow = nil
+        codexPrimaryRow = nil
+        codexSecondaryRow = nil
+
+        if Preferences.showClaude {
+            menu.addItem(headerItem(title: "Claude", showsRefresh: false, onRefresh: nil))
+            claudeFiveRow = addRow(claudeFiveContent(), to: menu)
+            claudeSevenRow = addRow(claudeSevenContent(), to: menu)
+            if let snapshot = claudeSnapshot {
+                let staleness = formatStaleness(snapshot.stalenessInterval)
+                let text = snapshot.isStale
+                    ? "⚠️ 最終更新 \(staleness)（セッション非アクティブ）"
+                    : "最終更新 \(staleness)"
+                menu.addItem(infoItem(text))
+            } else {
+                menu.addItem(infoItem("まだデータがありません（claudeを開いて1往復送ると反映されます）"))
+            }
+            if let message = statusLineMessage {
+                menu.addItem(infoItem("⚠️ \(message)"))
+            }
         }
+
+        if Preferences.showClaude && Preferences.showCodex {
+            menu.addItem(.separator())
+        }
+
+        if Preferences.showCodex {
+            menu.addItem(headerItem(title: "Codex", showsRefresh: true, onRefresh: { [weak self] in
+                self?.codexPoller.refreshNow()
+            }))
+            codexPrimaryRow = addRow(codexPrimaryContent(), to: menu)
+            if codexSnapshot?.secondary != nil {
+                codexSecondaryRow = addRow(codexSecondaryContent(), to: menu)
+            }
+            if let plan = codexSnapshot?.planType {
+                menu.addItem(infoItem("プラン: \(plan)"))
+            }
+            if let error = codexErrorMessage {
+                menu.addItem(infoItem("⚠️ \(error)"))
+            }
+        }
+
+        if Preferences.showClaude || Preferences.showCodex {
+            menu.addItem(.separator())
+        }
+
+        let claudeToggleView = ToggleRowView(title: "Claude を表示", isOn: Preferences.showClaude)
+        claudeToggleView.onChange = { [weak self] isOn in
+            self?.setClaudeVisible(isOn)
+        }
+        let claudeToggle = NSMenuItem()
+        claudeToggle.view = claudeToggleView
+        claudeToggle.isEnabled = true
+        menu.addItem(claudeToggle)
+
+        let codexToggleView = ToggleRowView(title: "Codex を表示", isOn: Preferences.showCodex)
+        codexToggleView.onChange = { [weak self] isOn in
+            self?.setCodexVisible(isOn)
+        }
+        let codexToggle = NSMenuItem()
+        codexToggle.view = codexToggleView
+        codexToggle.isEnabled = true
+        menu.addItem(codexToggle)
 
         menu.addItem(.separator())
-
-        menu.addItem(sectionHeader("Codex"))
-        menu.addItem(rowItem(.init(
-            label: codexSnapshot?.primary?.durationLabel ?? "primary",
-            window: codexSnapshot?.primary,
-            note: formatResetsAt(codexSnapshot?.primary?.resetsAt)
-        )))
-        if let secondary = codexSnapshot?.secondary {
-            menu.addItem(rowItem(.init(
-                label: secondary.durationLabel ?? "secondary",
-                window: secondary,
-                note: formatResetsAt(secondary.resetsAt)
-            )))
-        }
-        if let plan = codexSnapshot?.planType {
-            menu.addItem(infoItem("プラン: \(plan)"))
-        }
-        if let error = codexErrorMessage {
-            menu.addItem(infoItem("⚠️ \(error)"))
-        }
-
-        menu.addItem(.separator())
-
-        let refreshItem = NSMenuItem(title: "今すぐ更新 (Codex)", action: #selector(refreshCodex), keyEquivalent: "")
-        refreshItem.target = self
-        menu.addItem(refreshItem)
 
         let loginItem = NSMenuItem(title: "ログイン時に起動", action: #selector(toggleLoginItem), keyEquivalent: "")
         loginItem.target = self
@@ -110,18 +206,74 @@ final class StatusBarController: NSObject {
         let quitItem = NSMenuItem(title: "終了", action: #selector(quit), keyEquivalent: "q")
         quitItem.target = self
         menu.addItem(quitItem)
-
-        return menu
     }
 
-    private func sectionHeader(_ title: String) -> NSMenuItem {
-        let item = NSMenuItem(title: title, action: nil, keyEquivalent: "")
-        item.isEnabled = false
-        item.attributedTitle = NSAttributedString(
-            string: title,
-            attributes: [.font: NSFont.boldSystemFont(ofSize: 12)]
+    private func claudeFiveContent() -> DetailRowView.Content {
+        .init(
+            label: "5時間",
+            window: claudeSnapshot?.fiveHour,
+            note: formatResetsAt(claudeSnapshot?.fiveHour?.resetsAt)
         )
+    }
+
+    private func claudeSevenContent() -> DetailRowView.Content {
+        .init(
+            label: "週次",
+            window: claudeSnapshot?.sevenDay,
+            note: formatResetsAt(claudeSnapshot?.sevenDay?.resetsAt)
+        )
+    }
+
+    private func codexPrimaryContent() -> DetailRowView.Content {
+        .init(
+            label: codexSnapshot?.primary?.durationLabel ?? "primary",
+            window: codexSnapshot?.primary,
+            note: formatResetsAt(codexSnapshot?.primary?.resetsAt)
+        )
+    }
+
+    private func codexSecondaryContent() -> DetailRowView.Content {
+        .init(
+            label: codexSnapshot?.secondary?.durationLabel ?? "secondary",
+            window: codexSnapshot?.secondary,
+            note: formatResetsAt(codexSnapshot?.secondary?.resetsAt)
+        )
+    }
+
+    /// Pushes fresh snapshot data into the rows of the currently built menu,
+    /// so an open menu updates in place (DetailRowView redraws on content set).
+    /// If the update changes the menu's shape (a section or info row appears /
+    /// disappears), the open menu is rebuilt instead.
+    private func updateOpenMenuRows() {
+        guard menuIsOpen else { return }
+        if builtStructure != currentStructure() {
+            rebuildWhenSafe()
+            return
+        }
+        claudeFiveRow?.content = claudeFiveContent()
+        claudeSevenRow?.content = claudeSevenContent()
+        codexPrimaryRow?.content = codexPrimaryContent()
+        codexSecondaryRow?.content = codexSecondaryContent()
+    }
+
+    private func headerItem(title: String, showsRefresh: Bool, onRefresh: (() -> Void)?) -> NSMenuItem {
+        let view = SectionHeaderRowView(title: title, showsRefresh: showsRefresh)
+        view.onRefresh = onRefresh
+        let item = NSMenuItem()
+        // Must stay enabled when it hosts the refresh button — disabled items'
+        // views don't receive mouse events.
+        item.isEnabled = showsRefresh
+        item.view = view
         return item
+    }
+
+    private func addRow(_ content: DetailRowView.Content, to menu: NSMenu) -> DetailRowView {
+        let view = DetailRowView(content: content)
+        let item = NSMenuItem()
+        item.isEnabled = false
+        item.view = view
+        menu.addItem(item)
+        return view
     }
 
     private func infoItem(_ text: String) -> NSMenuItem {
@@ -137,15 +289,51 @@ final class StatusBarController: NSObject {
         return item
     }
 
-    private func rowItem(_ content: DetailRowView.Content) -> NSMenuItem {
-        let item = NSMenuItem()
-        item.isEnabled = false
-        item.view = DetailRowView(content: content)
-        return item
+    private func setClaudeVisible(_ visible: Bool) {
+        Preferences.showClaude = visible
+        if visible {
+            startClaude()
+        } else {
+            claudeWatcher.stop()
+            claudeSnapshot = nil
+            statusLineMessage = nil
+        }
+        refreshIcon()
+        scheduleMenuRebuild()
     }
 
-    @objc private func refreshCodex() {
-        codexPoller.refreshNow()
+    private func setCodexVisible(_ visible: Bool) {
+        Preferences.showCodex = visible
+        if visible {
+            codexPoller.start()
+        } else {
+            codexPoller.stop()
+            codexSnapshot = nil
+            codexErrorMessage = nil
+        }
+        refreshIcon()
+        scheduleMenuRebuild()
+    }
+
+    /// Restructures the (possibly open) menu. Deferred one runloop tick so the
+    /// ToggleRowView that triggered it isn't torn down while its own event
+    /// handler is still on the stack, and further postponed while any mouse
+    /// button is held — reshaping the menu mid-click would let the release
+    /// land on whichever item shifted under the cursor.
+    private func scheduleMenuRebuild() {
+        DispatchQueue.main.async { [weak self] in
+            self?.rebuildWhenSafe()
+        }
+    }
+
+    private func rebuildWhenSafe() {
+        guard NSEvent.pressedMouseButtons == 0 else {
+            DispatchQueue.main.asyncAfter(deadline: .now() + 0.2) { [weak self] in
+                self?.rebuildWhenSafe()
+            }
+            return
+        }
+        rebuildMenuNow()
     }
 
     private var isLoginItemEnabled: Bool {
@@ -162,7 +350,6 @@ final class StatusBarController: NSObject {
         } catch {
             NSLog("[RateGadget] login item toggle failed: %@", error.localizedDescription)
         }
-        refresh()
     }
 
     @objc private func quit() {

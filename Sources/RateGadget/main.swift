@@ -8,6 +8,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     }
 }
 
+Preferences.registerDefaults()
 let app = NSApplication.shared
 app.setActivationPolicy(.accessory)
 let delegate = AppDelegate()

@@ -45,37 +45,59 @@ final class GaugeBarView: NSView {
     }
 }
 
-/// Renders the always-visible menu bar icon: two thin gauge bars (Claude on
-/// top, Codex below), each preceded by a single-letter label.
+/// Renders the always-visible menu bar icon. Layout adapts to which sources
+/// are visible: two stacked bars (Claude on top, Codex below), a single
+/// centered bar, or a fallback glyph when both are hidden.
 enum MenuBarIconRenderer {
-    static func render(claude: RateWindow?, codex: RateWindow?) -> NSImage {
-        let size = NSSize(width: 46, height: 18)
+    struct Entry {
+        var label: String
+        var window: RateWindow?
+    }
+
+    static func iconWidth(entryCount: Int) -> CGFloat {
+        entryCount == 0 ? 24 : 46
+    }
+
+    static func render(entries: [Entry]) -> NSImage {
+        let size = NSSize(width: iconWidth(entryCount: entries.count), height: 18)
         let image = NSImage(size: size, flipped: false) { rect in
+            guard !entries.isEmpty else {
+                let attrs: [NSAttributedString.Key: Any] = [
+                    .font: NSFont.systemFont(ofSize: 11, weight: .semibold),
+                    .foregroundColor: NSColor.labelColor,
+                ]
+                let text = "RG" as NSString
+                let textSize = text.size(withAttributes: attrs)
+                text.draw(
+                    at: NSPoint(x: (rect.width - textSize.width) / 2, y: (rect.height - textSize.height) / 2),
+                    withAttributes: attrs
+                )
+                return true
+            }
+
             let labelAttrs: [NSAttributedString.Key: Any] = [
                 .font: NSFont.systemFont(ofSize: 8, weight: .semibold),
                 .foregroundColor: NSColor.labelColor,
             ]
             let barX: CGFloat = 12
             let barWidth = rect.width - barX - 2
+            let rowHeight: CGFloat = 8
 
-            let topBarRect = NSRect(x: barX, y: rect.height - 8, width: barWidth, height: 6)
-            ("C" as NSString).draw(at: NSPoint(x: 0, y: rect.height - 9), withAttributes: labelAttrs)
-            drawGaugeBar(
-                in: topBarRect,
-                usedPercent: claude?.usedPercent,
-                severity: claude?.severity ?? .ok,
-                trackColor: NSColor.tertiaryLabelColor
-            )
-
-            let bottomBarRect = NSRect(x: barX, y: 2, width: barWidth, height: 6)
-            ("X" as NSString).draw(at: NSPoint(x: 0, y: 1), withAttributes: labelAttrs)
-            drawGaugeBar(
-                in: bottomBarRect,
-                usedPercent: codex?.usedPercent,
-                severity: codex?.severity ?? .ok,
-                trackColor: NSColor.tertiaryLabelColor
-            )
-
+            for (index, entry) in entries.enumerated() {
+                let y: CGFloat
+                if entries.count == 1 {
+                    y = (rect.height - rowHeight) / 2 + 1
+                } else {
+                    y = index == 0 ? rect.height - rowHeight : 2
+                }
+                (entry.label as NSString).draw(at: NSPoint(x: 0, y: y - 1), withAttributes: labelAttrs)
+                drawGaugeBar(
+                    in: NSRect(x: barX, y: y, width: barWidth, height: 6),
+                    usedPercent: entry.window?.usedPercent,
+                    severity: entry.window?.severity ?? .ok,
+                    trackColor: NSColor.tertiaryLabelColor
+                )
+            }
             return true
         }
         image.isTemplate = false

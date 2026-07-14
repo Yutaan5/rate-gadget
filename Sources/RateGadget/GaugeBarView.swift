@@ -106,13 +106,18 @@ enum MenuBarIconRenderer {
 }
 
 /// A "label + switch" row used inside the dropdown menu for the show/hide
-/// toggles. Uses a real NSSwitch so the on/off state is visually obvious, and
-/// keeps the menu open while flipping (view-based menu items don't dismiss).
+/// toggles. The switch is drawn by hand: an NSSwitch inside a menu renders in
+/// the inactive (gray) appearance, so its on-state accent color never shows.
+/// Custom drawing keeps the ON state clearly colored. Clicking anywhere on the
+/// row flips it, and the menu stays open (view-based items don't dismiss).
 final class ToggleRowView: NSView {
-    private let toggle = NSSwitch()
+    private var isOn: Bool
     var onChange: ((Bool) -> Void)?
 
+    private let pillSize = NSSize(width: 32, height: 18)
+
     init(title: String, isOn: Bool, width: CGFloat = 300, height: CGFloat = 28) {
+        self.isOn = isOn
         super.init(frame: NSRect(x: 0, y: 0, width: width, height: height))
 
         let label = NSTextField(labelWithString: title)
@@ -120,33 +125,44 @@ final class ToggleRowView: NSView {
         label.sizeToFit()
         label.frame.origin = NSPoint(x: 14, y: (height - label.frame.height) / 2)
         addSubview(label)
-
-        toggle.state = isOn ? .on : .off
-        toggle.controlSize = .small
-        toggle.sizeToFit()
-        toggle.frame.origin = NSPoint(x: width - toggle.frame.width - 14, y: (height - toggle.frame.height) / 2)
-        toggle.target = self
-        toggle.action = #selector(switchChanged)
-        addSubview(toggle)
     }
 
     required init?(coder: NSCoder) {
         fatalError("init(coder:) has not been implemented")
     }
 
-    @objc private func switchChanged() {
-        onChange?(toggle.state == .on)
+    override func draw(_ dirtyRect: NSRect) {
+        super.draw(dirtyRect)
+
+        let pillRect = NSRect(
+            x: bounds.width - pillSize.width - 14,
+            y: (bounds.height - pillSize.height) / 2,
+            width: pillSize.width,
+            height: pillSize.height
+        )
+        let radius = pillSize.height / 2
+        let pillPath = NSBezierPath(roundedRect: pillRect, xRadius: radius, yRadius: radius)
+        (isOn ? NSColor.controlAccentColor : NSColor.tertiaryLabelColor).setFill()
+        pillPath.fill()
+
+        let knobDiameter = pillSize.height - 4
+        let knobX = isOn
+            ? pillRect.maxX - knobDiameter - 2
+            : pillRect.minX + 2
+        let knobRect = NSRect(
+            x: knobX,
+            y: pillRect.minY + 2,
+            width: knobDiameter,
+            height: knobDiameter
+        )
+        NSColor.white.setFill()
+        NSBezierPath(ovalIn: knobRect).fill()
     }
 
-    // Let a click anywhere on the row flip the switch, not just the knob.
     override func mouseDown(with event: NSEvent) {
-        let location = convert(event.locationInWindow, from: nil)
-        if !toggle.frame.contains(location) {
-            toggle.state = toggle.state == .on ? .off : .on
-            switchChanged()
-        } else {
-            super.mouseDown(with: event)
-        }
+        isOn.toggle()
+        needsDisplay = true
+        onChange?(isOn)
     }
 }
 

@@ -1,83 +1,45 @@
 import Foundation
 
-/// Watches the shared JSON file written by `claude-statusline.sh` and exposes
-/// the latest Claude Code rate-limit snapshot. Uses a filesystem event source
-/// for near-instant updates plus a fallback poll in case events are missed
-/// (e.g. the file didn't exist yet when we started watching).
+/// Reads the shared JSON file written by `claude-statusline.sh` on a short
+/// timer and publishes the latest Claude Code rate-limit snapshot.
+///
+/// The bridge file is replaced atomically (`mv tmp file`), so its inode changes
+/// on every write. A DispatchSource vnode watch tracks a single inode and would
+/// need constant, race-prone re-arming to follow those swaps — in practice it
+/// silently stopped following updates (notably after a login-launch), leaving a
+/// stale inode held open. Polling the path directly sidesteps inode identity
+/// entirely and survives sleep/wake and atomic replacement.
 final class ClaudeRateLimitWatcher {
     var onUpdate: ((ClaudeRateSnapshot) -> Void)?
 
     private let fileURL = StatusLineInstaller.supportDir.appendingPathComponent("claude-rate.json")
     private let queue = DispatchQueue(label: "rate-gadget.claude-watcher")
-    private var source: DispatchSourceFileSystemObject?
-    private var fallbackTimer: DispatchSourceTimer?
-    private var fileDescriptor: Int32 = -1
+    private var timer: DispatchSourceTimer?
+    private var lastUpdatedAt: Double?
+
+    private static let pollInterval: TimeInterval = 5
 
     func start() {
         queue.async { [weak self] in
-            self?.readAndNotify()
-            self?.watchFile()
-            self?.scheduleFallbackPoll()
+            guard let self else { return }
+            self.lastUpdatedAt = nil // ensure the first read always publishes
+            self.readAndNotify()
+
+            let timer = DispatchSource.makeTimerSource(queue: self.queue)
+            timer.schedule(deadline: .now() + Self.pollInterval, repeating: Self.pollInterval)
+            timer.setEventHandler { [weak self] in
+                self?.readAndNotify()
+            }
+            timer.resume()
+            self.timer = timer
         }
     }
 
     func stop() {
         queue.async { [weak self] in
-            // The source's cancel handler owns closing the descriptor.
-            self?.source?.cancel()
-            self?.source = nil
-            self?.fileDescriptor = -1
-            self?.fallbackTimer?.cancel()
-            self?.fallbackTimer = nil
+            self?.timer?.cancel()
+            self?.timer = nil
         }
-    }
-
-    private func watchFile() {
-        // Cancelling triggers the old source's cancel handler, which closes the
-        // fd it captured — never close inline here or we'd double-close.
-        source?.cancel()
-        source = nil
-        fileDescriptor = -1
-
-        let fd = open(fileURL.path, O_EVTONLY)
-        guard fd >= 0 else {
-            // File doesn't exist yet (Claude hasn't run since install) — rely on
-            // the fallback poll to notice once it's created.
-            return
-        }
-        fileDescriptor = fd
-
-        let newSource = DispatchSource.makeFileSystemObjectSource(
-            fileDescriptor: fd,
-            eventMask: [.write, .delete, .rename],
-            queue: queue
-        )
-        newSource.setEventHandler { [weak self] in
-            self?.readAndNotify()
-            // A `rename` (atomic replace via mv) invalidates the descriptor;
-            // re-open so future writes are still observed.
-            self?.watchFile()
-        }
-        newSource.setCancelHandler {
-            // Capture the fd by value: by the time this runs, self.fileDescriptor
-            // may already refer to a newer descriptor.
-            close(fd)
-        }
-        newSource.resume()
-        source = newSource
-    }
-
-    private func scheduleFallbackPoll() {
-        let timer = DispatchSource.makeTimerSource(queue: queue)
-        timer.schedule(deadline: .now() + 30, repeating: 30)
-        timer.setEventHandler { [weak self] in
-            self?.readAndNotify()
-            if self?.fileDescriptor ?? -1 < 0 {
-                self?.watchFile()
-            }
-        }
-        timer.resume()
-        fallbackTimer = timer
     }
 
     private func readAndNotify() {
@@ -88,6 +50,10 @@ final class ClaudeRateLimitWatcher {
         guard let updatedAtSecs = obj["updated_at"] as? Double ?? (obj["updated_at"] as? Int).map(Double.init) else {
             return
         }
+        // Republish only when the snapshot actually changed.
+        if let last = lastUpdatedAt, last == updatedAtSecs { return }
+        lastUpdatedAt = updatedAtSecs
+
         let snapshot = ClaudeRateSnapshot(
             fiveHour: Self.parseWindow(obj["five_hour"]),
             sevenDay: Self.parseWindow(obj["seven_day"]),

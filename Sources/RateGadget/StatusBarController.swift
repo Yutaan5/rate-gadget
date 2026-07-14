@@ -16,6 +16,13 @@ final class StatusBarController: NSObject, NSMenuDelegate {
     private var codexErrorMessage: String?
     private var statusLineMessage: String?
 
+    // Gauge rows of the currently built menu, kept so data arriving while the
+    // menu is open (e.g. after tapping the refresh button) updates in place.
+    private var claudeFiveRow: DetailRowView?
+    private var claudeSevenRow: DetailRowView?
+    private var codexPrimaryRow: DetailRowView?
+    private var codexSecondaryRow: DetailRowView?
+
     override init() {
         super.init()
 
@@ -26,6 +33,7 @@ final class StatusBarController: NSObject, NSMenuDelegate {
             self?.codexSnapshot = snapshot
             self?.codexErrorMessage = nil
             self?.refreshIcon()
+            self?.updateOpenMenuRows()
         }
         codexPoller.onError = { [weak self] message in
             self?.codexErrorMessage = message
@@ -34,6 +42,7 @@ final class StatusBarController: NSObject, NSMenuDelegate {
         claudeWatcher.onUpdate = { [weak self] snapshot in
             self?.claudeSnapshot = snapshot
             self?.refreshIcon()
+            self?.updateOpenMenuRows()
         }
 
         if Preferences.showClaude {
@@ -72,19 +81,15 @@ final class StatusBarController: NSObject, NSMenuDelegate {
     }
 
     private func buildMenu(into menu: NSMenu) {
+        claudeFiveRow = nil
+        claudeSevenRow = nil
+        codexPrimaryRow = nil
+        codexSecondaryRow = nil
 
         if Preferences.showClaude {
-            menu.addItem(sectionHeader("Claude"))
-            menu.addItem(rowItem(.init(
-                label: "5時間",
-                window: claudeSnapshot?.fiveHour,
-                note: formatResetsAt(claudeSnapshot?.fiveHour?.resetsAt)
-            )))
-            menu.addItem(rowItem(.init(
-                label: "週次",
-                window: claudeSnapshot?.sevenDay,
-                note: formatResetsAt(claudeSnapshot?.sevenDay?.resetsAt)
-            )))
+            menu.addItem(headerItem(title: "Claude", showsRefresh: false, onRefresh: nil))
+            claudeFiveRow = addRow(claudeFiveContent(), to: menu)
+            claudeSevenRow = addRow(claudeSevenContent(), to: menu)
             if let snapshot = claudeSnapshot {
                 let staleness = formatStaleness(snapshot.stalenessInterval)
                 let text = snapshot.isStale
@@ -104,18 +109,12 @@ final class StatusBarController: NSObject, NSMenuDelegate {
         }
 
         if Preferences.showCodex {
-            menu.addItem(sectionHeader("Codex"))
-            menu.addItem(rowItem(.init(
-                label: codexSnapshot?.primary?.durationLabel ?? "primary",
-                window: codexSnapshot?.primary,
-                note: formatResetsAt(codexSnapshot?.primary?.resetsAt)
-            )))
-            if let secondary = codexSnapshot?.secondary {
-                menu.addItem(rowItem(.init(
-                    label: secondary.durationLabel ?? "secondary",
-                    window: secondary,
-                    note: formatResetsAt(secondary.resetsAt)
-                )))
+            menu.addItem(headerItem(title: "Codex", showsRefresh: true, onRefresh: { [weak self] in
+                self?.codexPoller.refreshNow()
+            }))
+            codexPrimaryRow = addRow(codexPrimaryContent(), to: menu)
+            if codexSnapshot?.secondary != nil {
+                codexSecondaryRow = addRow(codexSecondaryContent(), to: menu)
             }
             if let plan = codexSnapshot?.planType {
                 menu.addItem(infoItem("プラン: \(plan)"))
@@ -147,12 +146,6 @@ final class StatusBarController: NSObject, NSMenuDelegate {
 
         menu.addItem(.separator())
 
-        if Preferences.showCodex {
-            let refreshItem = NSMenuItem(title: "今すぐ更新 (Codex)", action: #selector(refreshCodex), keyEquivalent: "")
-            refreshItem.target = self
-            menu.addItem(refreshItem)
-        }
-
         let loginItem = NSMenuItem(title: "ログイン時に起動", action: #selector(toggleLoginItem), keyEquivalent: "")
         loginItem.target = self
         loginItem.state = isLoginItemEnabled ? .on : .off
@@ -165,14 +158,63 @@ final class StatusBarController: NSObject, NSMenuDelegate {
         menu.addItem(quitItem)
     }
 
-    private func sectionHeader(_ title: String) -> NSMenuItem {
-        let item = NSMenuItem(title: title, action: nil, keyEquivalent: "")
-        item.isEnabled = false
-        item.attributedTitle = NSAttributedString(
-            string: title,
-            attributes: [.font: NSFont.boldSystemFont(ofSize: 12)]
+    private func claudeFiveContent() -> DetailRowView.Content {
+        .init(
+            label: "5時間",
+            window: claudeSnapshot?.fiveHour,
+            note: formatResetsAt(claudeSnapshot?.fiveHour?.resetsAt)
         )
+    }
+
+    private func claudeSevenContent() -> DetailRowView.Content {
+        .init(
+            label: "週次",
+            window: claudeSnapshot?.sevenDay,
+            note: formatResetsAt(claudeSnapshot?.sevenDay?.resetsAt)
+        )
+    }
+
+    private func codexPrimaryContent() -> DetailRowView.Content {
+        .init(
+            label: codexSnapshot?.primary?.durationLabel ?? "primary",
+            window: codexSnapshot?.primary,
+            note: formatResetsAt(codexSnapshot?.primary?.resetsAt)
+        )
+    }
+
+    private func codexSecondaryContent() -> DetailRowView.Content {
+        .init(
+            label: codexSnapshot?.secondary?.durationLabel ?? "secondary",
+            window: codexSnapshot?.secondary,
+            note: formatResetsAt(codexSnapshot?.secondary?.resetsAt)
+        )
+    }
+
+    /// Pushes fresh snapshot data into the rows of the currently built menu,
+    /// so an open menu updates in place (DetailRowView redraws on content set).
+    private func updateOpenMenuRows() {
+        claudeFiveRow?.content = claudeFiveContent()
+        claudeSevenRow?.content = claudeSevenContent()
+        codexPrimaryRow?.content = codexPrimaryContent()
+        codexSecondaryRow?.content = codexSecondaryContent()
+    }
+
+    private func headerItem(title: String, showsRefresh: Bool, onRefresh: (() -> Void)?) -> NSMenuItem {
+        let view = SectionHeaderRowView(title: title, showsRefresh: showsRefresh)
+        view.onRefresh = onRefresh
+        let item = NSMenuItem()
+        item.isEnabled = false
+        item.view = view
         return item
+    }
+
+    private func addRow(_ content: DetailRowView.Content, to menu: NSMenu) -> DetailRowView {
+        let view = DetailRowView(content: content)
+        let item = NSMenuItem()
+        item.isEnabled = false
+        item.view = view
+        menu.addItem(item)
+        return view
     }
 
     private func infoItem(_ text: String) -> NSMenuItem {
@@ -185,13 +227,6 @@ final class StatusBarController: NSObject, NSMenuDelegate {
                 .foregroundColor: NSColor.secondaryLabelColor,
             ]
         )
-        return item
-    }
-
-    private func rowItem(_ content: DetailRowView.Content) -> NSMenuItem {
-        let item = NSMenuItem()
-        item.isEnabled = false
-        item.view = DetailRowView(content: content)
         return item
     }
 
@@ -219,10 +254,6 @@ final class StatusBarController: NSObject, NSMenuDelegate {
             codexErrorMessage = nil
         }
         refreshIcon()
-    }
-
-    @objc private func refreshCodex() {
-        codexPoller.refreshNow()
     }
 
     private var isLoginItemEnabled: Bool {

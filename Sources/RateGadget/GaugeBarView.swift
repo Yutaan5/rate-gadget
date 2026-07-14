@@ -166,6 +166,49 @@ final class ToggleRowView: NSView {
     }
 }
 
+/// A bold section header row ("Claude" / "Codex"), optionally with a small
+/// refresh button beside the title. Used instead of a plain disabled menu item
+/// so the header can host the button.
+final class SectionHeaderRowView: NSView {
+    var onRefresh: (() -> Void)?
+
+    init(title: String, showsRefresh: Bool, width: CGFloat = 300, height: CGFloat = 22) {
+        super.init(frame: NSRect(x: 0, y: 0, width: width, height: height))
+
+        let label = NSTextField(labelWithString: title)
+        label.font = NSFont.boldSystemFont(ofSize: 12)
+        label.sizeToFit()
+        label.frame.origin = NSPoint(x: 14, y: (height - label.frame.height) / 2)
+        addSubview(label)
+
+        guard showsRefresh else { return }
+        let image = NSImage(systemSymbolName: "arrow.clockwise", accessibilityDescription: "更新")
+            ?? NSImage(named: NSImage.refreshTemplateName)!
+        let button = NSButton(image: image, target: self, action: #selector(refreshClicked))
+        button.isBordered = false
+        button.bezelStyle = .regularSquare
+        button.imageScaling = .scaleProportionallyDown
+        button.contentTintColor = .secondaryLabelColor
+        button.toolTip = "今すぐ更新"
+        let side: CGFloat = 18
+        button.frame = NSRect(
+            x: label.frame.maxX + 8,
+            y: (height - side) / 2,
+            width: side,
+            height: side
+        )
+        addSubview(button)
+    }
+
+    required init?(coder: NSCoder) {
+        fatalError("init(coder:) has not been implemented")
+    }
+
+    @objc private func refreshClicked() {
+        onRefresh?()
+    }
+}
+
 /// A single "label — bar — percent — note" row used inside the dropdown menu.
 final class DetailRowView: NSView {
     struct Content {

@@ -26,6 +26,11 @@ final class StatusBarController: NSObject, NSMenuDelegate {
     override init() {
         super.init()
 
+        // With autoenablesItems (the default), view-based items that carry no
+        // action get auto-disabled on menu.update(), and disabled items' views
+        // never receive mouse events — which silently kills the toggle rows
+        // and the refresh button. Manage enabled state explicitly instead.
+        menu.autoenablesItems = false
         menu.delegate = self
         statusItem.menu = menu
 
@@ -134,6 +139,7 @@ final class StatusBarController: NSObject, NSMenuDelegate {
         }
         let claudeToggle = NSMenuItem()
         claudeToggle.view = claudeToggleView
+        claudeToggle.isEnabled = true
         menu.addItem(claudeToggle)
 
         let codexToggleView = ToggleRowView(title: "Codex を表示", isOn: Preferences.showCodex)
@@ -142,6 +148,7 @@ final class StatusBarController: NSObject, NSMenuDelegate {
         }
         let codexToggle = NSMenuItem()
         codexToggle.view = codexToggleView
+        codexToggle.isEnabled = true
         menu.addItem(codexToggle)
 
         menu.addItem(.separator())
@@ -203,7 +210,9 @@ final class StatusBarController: NSObject, NSMenuDelegate {
         let view = SectionHeaderRowView(title: title, showsRefresh: showsRefresh)
         view.onRefresh = onRefresh
         let item = NSMenuItem()
-        item.isEnabled = false
+        // Must stay enabled when it hosts the refresh button — disabled items'
+        // views don't receive mouse events.
+        item.isEnabled = showsRefresh
         item.view = view
         return item
     }

@@ -139,13 +139,16 @@ final class StatusBarController: NSObject, NSMenuDelegate {
             claudeFiveRow = addRow(claudeFiveContent(), to: menu)
             claudeSevenRow = addRow(claudeSevenContent(), to: menu)
             if let snapshot = claudeSnapshot {
+                // Claude only reports usage while a Claude Code session is being
+                // used, so always spell out how to refresh it. Flag it when the
+                // value has gone stale, but keep the actionable hint either way.
                 let staleness = formatStaleness(snapshot.stalenessInterval)
-                let text = snapshot.isStale
-                    ? "⚠️ 最終更新 \(staleness)（セッション非アクティブ）"
-                    : "最終更新 \(staleness)"
-                menu.addItem(infoItem(text))
+                let prefix = snapshot.isStale ? "⚠️ " : ""
+                menu.addItem(infoItem("\(prefix)最終更新 \(staleness)"))
+                menu.addItem(infoItem("Claude Code を操作すると更新されます"))
             } else {
-                menu.addItem(infoItem("まだデータがありません（claudeを開いて1往復送ると反映されます）"))
+                menu.addItem(infoItem("データ未取得"))
+                menu.addItem(infoItem("Claude Code で一度やり取りすると表示されます"))
             }
             if let message = statusLineMessage {
                 menu.addItem(infoItem("⚠️ \(message)"))

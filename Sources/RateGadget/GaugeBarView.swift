@@ -159,7 +159,15 @@ final class ToggleRowView: NSView {
         NSBezierPath(ovalIn: knobRect).fill()
     }
 
-    override func mouseDown(with event: NSEvent) {
+    // Act on mouseUp, not mouseDown: flipping restructures the open menu, and
+    // if rows shift while the button is still held, the subsequent mouseUp
+    // would land on (and activate) whatever item moved under the cursor —
+    // e.g. 終了. Swallow mouseDown so menu tracking doesn't act on it either.
+    override func mouseDown(with event: NSEvent) {}
+
+    override func mouseUp(with event: NSEvent) {
+        let location = convert(event.locationInWindow, from: nil)
+        guard bounds.contains(location) else { return }
         isOn.toggle()
         needsDisplay = true
         onChange?(isOn)

@@ -247,7 +247,7 @@ final class StatusBarController: NSObject, NSMenuDelegate {
     private func updateOpenMenuRows() {
         guard menuIsOpen else { return }
         if builtStructure != currentStructure() {
-            rebuildMenuNow()
+            rebuildWhenSafe()
             return
         }
         claudeFiveRow?.content = claudeFiveContent()
@@ -316,12 +316,24 @@ final class StatusBarController: NSObject, NSMenuDelegate {
     }
 
     /// Restructures the (possibly open) menu. Deferred one runloop tick so the
-    /// ToggleRowView that triggered it isn't torn down while its own mouseDown
-    /// is still on the stack.
+    /// ToggleRowView that triggered it isn't torn down while its own event
+    /// handler is still on the stack, and further postponed while any mouse
+    /// button is held — reshaping the menu mid-click would let the release
+    /// land on whichever item shifted under the cursor.
     private func scheduleMenuRebuild() {
         DispatchQueue.main.async { [weak self] in
-            self?.rebuildMenuNow()
+            self?.rebuildWhenSafe()
         }
+    }
+
+    private func rebuildWhenSafe() {
+        guard NSEvent.pressedMouseButtons == 0 else {
+            DispatchQueue.main.asyncAfter(deadline: .now() + 0.2) { [weak self] in
+                self?.rebuildWhenSafe()
+            }
+            return
+        }
+        rebuildMenuNow()
     }
 
     private var isLoginItemEnabled: Bool {

@@ -23,6 +23,34 @@ final class StatusBarController: NSObject, NSMenuDelegate {
     private var codexPrimaryRow: DetailRowView?
     private var codexSecondaryRow: DetailRowView?
 
+    private var menuIsOpen = false
+
+    /// Which optional pieces the currently built menu contains. When incoming
+    /// data changes one of these, an in-place row update isn't enough and the
+    /// open menu is rebuilt.
+    private struct MenuStructure: Equatable {
+        var showClaude: Bool
+        var showCodex: Bool
+        var claudeHasData: Bool
+        var codexHasSecondary: Bool
+        var codexHasPlan: Bool
+        var codexHasError: Bool
+        var hasStatusLineMessage: Bool
+    }
+    private var builtStructure: MenuStructure?
+
+    private func currentStructure() -> MenuStructure {
+        MenuStructure(
+            showClaude: Preferences.showClaude,
+            showCodex: Preferences.showCodex,
+            claudeHasData: claudeSnapshot != nil,
+            codexHasSecondary: codexSnapshot?.secondary != nil,
+            codexHasPlan: codexSnapshot?.planType != nil,
+            codexHasError: codexErrorMessage != nil,
+            hasStatusLineMessage: statusLineMessage != nil
+        )
+    }
+
     override init() {
         super.init()
 
@@ -79,10 +107,25 @@ final class StatusBarController: NSObject, NSMenuDelegate {
     }
 
     /// Rebuilds the menu contents each time it is about to open, so the data
-    /// rows are always current without touching the menu while it's tracking.
+    /// rows are always current.
     func menuNeedsUpdate(_ menu: NSMenu) {
+        rebuildMenuNow()
+    }
+
+    func menuWillOpen(_ menu: NSMenu) {
+        menuIsOpen = true
+    }
+
+    func menuDidClose(_ menu: NSMenu) {
+        menuIsOpen = false
+    }
+
+    /// NSMenu reflects item changes while open, so this also serves the
+    /// toggle rows: flipping a switch restructures the visible menu in place.
+    private func rebuildMenuNow() {
         menu.removeAllItems()
         buildMenu(into: menu)
+        builtStructure = currentStructure()
     }
 
     private func buildMenu(into menu: NSMenu) {
@@ -199,7 +242,14 @@ final class StatusBarController: NSObject, NSMenuDelegate {
 
     /// Pushes fresh snapshot data into the rows of the currently built menu,
     /// so an open menu updates in place (DetailRowView redraws on content set).
+    /// If the update changes the menu's shape (a section or info row appears /
+    /// disappears), the open menu is rebuilt instead.
     private func updateOpenMenuRows() {
+        guard menuIsOpen else { return }
+        if builtStructure != currentStructure() {
+            rebuildMenuNow()
+            return
+        }
         claudeFiveRow?.content = claudeFiveContent()
         claudeSevenRow?.content = claudeSevenContent()
         codexPrimaryRow?.content = codexPrimaryContent()
@@ -248,9 +298,8 @@ final class StatusBarController: NSObject, NSMenuDelegate {
             claudeSnapshot = nil
             statusLineMessage = nil
         }
-        // Only the icon updates immediately; the open menu's data sections
-        // reflect the change the next time it opens (menuNeedsUpdate).
         refreshIcon()
+        scheduleMenuRebuild()
     }
 
     private func setCodexVisible(_ visible: Bool) {
@@ -263,6 +312,16 @@ final class StatusBarController: NSObject, NSMenuDelegate {
             codexErrorMessage = nil
         }
         refreshIcon()
+        scheduleMenuRebuild()
+    }
+
+    /// Restructures the (possibly open) menu. Deferred one runloop tick so the
+    /// ToggleRowView that triggered it isn't torn down while its own mouseDown
+    /// is still on the stack.
+    private func scheduleMenuRebuild() {
+        DispatchQueue.main.async { [weak self] in
+            self?.rebuildMenuNow()
+        }
     }
 
     private var isLoginItemEnabled: Bool {

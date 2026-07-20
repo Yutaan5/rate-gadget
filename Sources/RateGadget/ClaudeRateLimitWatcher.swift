@@ -11,18 +11,22 @@ import Foundation
 /// entirely and survives sleep/wake and atomic replacement.
 final class ClaudeRateLimitWatcher {
     var onUpdate: ((ClaudeRateSnapshot) -> Void)?
+    var onError: ((String) -> Void)?
 
     private let fileURL = StatusLineInstaller.supportDir.appendingPathComponent("claude-rate.json")
     private let queue = DispatchQueue(label: "rate-gadget.claude-watcher")
     private var timer: DispatchSourceTimer?
     private var lastUpdatedAt: Double?
+    private var lastErrorMessage: String?
 
     private static let pollInterval: TimeInterval = 5
 
     func start() {
         queue.async { [weak self] in
             guard let self else { return }
+            self.timer?.cancel()
             self.lastUpdatedAt = nil // ensure the first read always publishes
+            self.lastErrorMessage = nil
             self.readAndNotify()
 
             let timer = DispatchSource.makeTimerSource(queue: self.queue)
@@ -43,11 +47,20 @@ final class ClaudeRateLimitWatcher {
     }
 
     private func readAndNotify() {
-        guard let data = try? Data(contentsOf: fileURL),
-              let obj = try? JSONSerialization.jsonObject(with: data) as? [String: Any] else {
+        guard FileManager.default.fileExists(atPath: fileURL.path) else { return }
+        let data: Data
+        let object: Any
+        do {
+            data = try Data(contentsOf: fileURL)
+            object = try JSONSerialization.jsonObject(with: data)
+        } catch {
+            publishError("Claudeのレートファイルを読み取れません: \(error.localizedDescription)")
             return
         }
-        guard let updatedAtSecs = obj["updated_at"] as? Double ?? (obj["updated_at"] as? Int).map(Double.init) else {
+        guard let obj = object as? [String: Any],
+              let updatedAtSecs = obj["updated_at"] as? Double
+                ?? (obj["updated_at"] as? Int).map(Double.init) else {
+            publishError("Claudeのレートファイルの形式が不正です")
             return
         }
         // Republish only when the snapshot actually changed.
@@ -59,12 +72,25 @@ final class ClaudeRateLimitWatcher {
             sevenDay: Self.parseWindow(obj["seven_day"]),
             updatedAt: Date(timeIntervalSince1970: updatedAtSecs)
         )
+        guard snapshot.fiveHour != nil || snapshot.sevenDay != nil else {
+            publishError("Claudeのレート応答に使用率が含まれていません")
+            return
+        }
+        lastErrorMessage = nil
         DispatchQueue.main.async { [weak self] in
             self?.onUpdate?(snapshot)
         }
     }
 
-    private static func parseWindow(_ raw: Any?) -> RateWindow? {
+    private func publishError(_ message: String) {
+        guard message != lastErrorMessage else { return }
+        lastErrorMessage = message
+        DispatchQueue.main.async { [weak self] in
+            self?.onError?(message)
+        }
+    }
+
+    static func parseWindow(_ raw: Any?) -> RateWindow? {
         guard let dict = raw as? [String: Any] else { return nil }
         let percentRaw = dict["used_percentage"]
         let usedPercent: Int

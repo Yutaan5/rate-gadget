@@ -10,7 +10,7 @@ BUNDLE_ID="dev.tsuji.rategadget"
 OUT_APP="${APP_NAME}.app"
 
 echo "==> swift build -c release"
-swift build -c release
+swift build -c release --product "$APP_NAME"
 
 BIN_PATH="$(swift build -c release --show-bin-path)/${APP_NAME}"
 
@@ -20,6 +20,7 @@ mkdir -p "$OUT_APP/Contents/MacOS" "$OUT_APP/Contents/Resources"
 
 cp "$BIN_PATH" "$OUT_APP/Contents/MacOS/${APP_NAME}"
 cp Resources/claude-statusline.sh "$OUT_APP/Contents/Resources/claude-statusline.sh"
+cp Resources/claude-statusline.js "$OUT_APP/Contents/Resources/claude-statusline.js"
 
 cat > "$OUT_APP/Contents/Info.plist" <<PLIST
 <?xml version="1.0" encoding="UTF-8"?>

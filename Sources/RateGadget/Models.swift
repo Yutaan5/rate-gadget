@@ -28,7 +28,7 @@ struct RateWindow {
     }
 }
 
-enum Severity {
+enum Severity: Equatable {
     case ok
     case warn
     case critical
@@ -59,6 +59,12 @@ struct CodexRateSnapshot {
     var updatedAt: Date
 
     var headline: RateWindow? { primary ?? secondary }
+
+    /// A healthy poll happens once a minute. Treat three missed polls as stale
+    /// so a hung app-server can never leave an apparently-current gauge behind.
+    static let staleThreshold: TimeInterval = 3 * 60
+    var stalenessInterval: TimeInterval { Date().timeIntervalSince(updatedAt) }
+    var isStale: Bool { stalenessInterval > Self.staleThreshold }
 }
 
 func formatPercent(_ value: Int?) -> String {
@@ -66,27 +72,39 @@ func formatPercent(_ value: Int?) -> String {
     return "\(value)%"
 }
 
-func formatResetsAt(_ date: Date?) -> String {
+func formatResetsAt(
+    _ date: Date?,
+    now: Date = Date(),
+    calendar: Calendar = .current
+) -> String {
     guard let date else { return "-" }
-    let now = Date()
-    let interval = date.timeIntervalSince(now)
-    if interval <= 0 { return "まもなく" }
+    if date <= now { return "時刻経過" }
 
-    if interval < 24 * 60 * 60 {
-        let formatter = DateFormatter()
+    let formatter = DateFormatter()
+    formatter.calendar = calendar
+    formatter.locale = Locale(identifier: "ja_JP")
+    formatter.timeZone = calendar.timeZone
+
+    if calendar.isDate(date, inSameDayAs: now) {
         formatter.dateFormat = "HH:mm"
         return "今日 \(formatter.string(from: date))"
-    } else {
-        let formatter = DateFormatter()
-        formatter.dateFormat = "M/d HH:mm"
-        return formatter.string(from: date)
     }
+    if let tomorrow = calendar.date(byAdding: .day, value: 1, to: now),
+       calendar.isDate(date, inSameDayAs: tomorrow) {
+        formatter.dateFormat = "HH:mm"
+        return "明日 \(formatter.string(from: date))"
+    }
+
+    formatter.dateFormat = "M/d HH:mm"
+    return formatter.string(from: date)
 }
 
 func formatStaleness(_ interval: TimeInterval) -> String {
-    if interval < 60 { return "たった今" }
-    let minutes = Int(interval / 60)
+    let safeInterval = max(0, interval)
+    if safeInterval < 60 { return "たった今" }
+    let minutes = Int(safeInterval / 60)
     if minutes < 60 { return "\(minutes)分前" }
     let hours = minutes / 60
+    if hours >= 24 { return "\(hours / 24)日前" }
     return "\(hours)時間前"
 }

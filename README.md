@@ -15,8 +15,23 @@ Claude Code と Codex CLI のレート制限（使用量制限）の使用率を
   アプリはこのファイルを監視して表示に反映する。
   - Claude Code の TUI セッションがアクティブな間しか更新されないため、
     一定時間更新がない場合は「最終更新 X分前」と表示される。
-  - **注意**: Claude Code は statusLine コマンドを `/bin/sh` に引用符なしで渡すため、
-    スクリプトのパスに空白を含めてはならない（`Application Support` 配下は不可）。
+  - 主な更新タイミングは「Claudeへメッセージを送信し、アシスタントの応答が完了した後」。
+    RateGadgetはブリッジファイルを5秒間隔で確認するため、応答完了後、最大5秒で反映される。
+    入力中・応答生成中・Claude Codeがアイドルまたは終了中には更新されない。
+  - `/compact`の完了、権限モードの変更、Vimモードの切り替えでもstatusLineは更新される。
+  - statusLine入力のうち保存するのは使用率・リセット時刻・更新時刻だけ。セッションID、
+    作業ディレクトリ、transcriptパスなどの生入力は保存しない。
+  - JSON処理にはmacOS標準のJavaScript for Automationを使うため、`jq`等の追加ツールは不要。
+
+## 表示状態
+
+- `C` / `X`: 正常に取得したClaude / Codexの使用率
+- `C·` / `X·`: まだデータを取得していない
+- `C!` / `X!` + 灰色ゲージ: データが古い
+- `C!` / `X!` + 赤色ゲージ: 取得または連携エラー
+
+Claudeは30分、Codexは3分更新がなければ古いデータとして扱う。古い値を破棄はしないが、
+正常な現在値とは区別して表示する。
 
 ## ビルド
 
@@ -31,9 +46,11 @@ Finderで右クリック→「開く」。
 
 ## 初回起動時の動作
 
-- `~/.claude/settings.json` に `statusLine` 設定が無ければ自動追加する
-  （追加前に `settings.json.bak-<timestamp>` へバックアップを作成）。
+- `~/.claude` が無い場合は安全に作成する。
+- `~/.claude/settings.json` に `statusLine` 設定が無ければ自動追加する。
+- 既存ファイルを変更する場合は、先に `settings.json.bak-<timestamp>-<id>` へバックアップする。
 - 既に他の `statusLine` 設定がある場合は上書きせず、手動連携の案内をメニューに表示する。
+- `settings.json` が不正または読み取れない場合は一切上書きせず、エラーを表示する。
 
 ## 表示のカスタマイズ
 
@@ -43,21 +60,36 @@ Finderで右クリック→「開く」。
 
 - Codex 非表示 → `codex app-server` サブプロセスを起動しない
   （Codex CLI をインストールしていない人はこれをオフにする）
-- Claude 非表示 → statusLine の自動設定・ブリッジファイル監視を行わない
+- Claude 非表示 → RateGadget自身のstatusLine設定、連携スクリプト、保存済みレートファイルを
+  安全に削除する。他のstatusLine設定やClaude設定は変更しない。
+
+## テスト
+
+Xcodeや外部テストライブラリなしで、モデル、日時表示、CLIレスポンスのパース、Claude設定の
+導入・解除、ブリッジのプライバシーとファイル権限を検証できる。
+
+```sh
+./run-tests.sh
+```
 
 ## 構成
 
 ```
 Sources/RateGadget/
-  main.swift                   # エントリポイント
+  Application.swift            # アプリケーションライフサイクル
   StatusBarController.swift    # NSStatusItem + ドロップダウンメニュー
   GaugeBarView.swift           # ゲージバー描画
   CodexRateLimitPoller.swift   # codex app-server JSON-RPCクライアント
   ClaudeRateLimitWatcher.swift # ブリッジファイル監視
   StatusLineInstaller.swift    # statusLine 自動設定・移行
   Models.swift                 # 共通モデルとパース
+Sources/RateGadgetApp/
+  main.swift                   # エントリポイント
 Resources/
-  claude-statusline.sh         # statusLine ブリッジスクリプト
+  claude-statusline.sh         # statusLine エントリポイント
+  claude-statusline.js         # JSON抽出・原子的書き込み
+Tests/RateGadgetTests/
+  main.swift                   # Xcode不要の回帰テスト
 ```
 
 ## 注意事項

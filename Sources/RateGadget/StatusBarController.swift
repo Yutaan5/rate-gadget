@@ -12,9 +12,13 @@ final class StatusBarController: NSObject, NSMenuDelegate {
     private let claudeWatcher = ClaudeRateLimitWatcher()
 
     private var claudeSnapshot: ClaudeRateSnapshot?
+    private var claudeErrorMessage: String?
     private var codexSnapshot: CodexRateSnapshot?
     private var codexErrorMessage: String?
     private var statusLineMessage: String?
+    private var generalMessage: String?
+    private var freshnessTimer: Timer?
+    private var appearanceObservation: NSKeyValueObservation?
 
     // Gauge rows of the currently built menu, kept so data arriving while the
     // menu is open (e.g. after tapping the refresh button) updates in place.
@@ -32,10 +36,15 @@ final class StatusBarController: NSObject, NSMenuDelegate {
         var showClaude: Bool
         var showCodex: Bool
         var claudeHasData: Bool
+        var claudeIsStale: Bool
+        var codexHasData: Bool
+        var codexIsStale: Bool
         var codexHasSecondary: Bool
-        var codexHasPlan: Bool
-        var codexHasError: Bool
-        var hasStatusLineMessage: Bool
+        var codexPlanType: String?
+        var codexErrorMessage: String?
+        var claudeErrorMessage: String?
+        var statusLineMessage: String?
+        var generalMessage: String?
     }
     private var builtStructure: MenuStructure?
 
@@ -44,10 +53,15 @@ final class StatusBarController: NSObject, NSMenuDelegate {
             showClaude: Preferences.showClaude,
             showCodex: Preferences.showCodex,
             claudeHasData: claudeSnapshot != nil,
+            claudeIsStale: claudeSnapshot?.isStale ?? false,
+            codexHasData: codexSnapshot != nil,
+            codexIsStale: codexSnapshot?.isStale ?? false,
             codexHasSecondary: codexSnapshot?.secondary != nil,
-            codexHasPlan: codexSnapshot?.planType != nil,
-            codexHasError: codexErrorMessage != nil,
-            hasStatusLineMessage: statusLineMessage != nil
+            codexPlanType: codexSnapshot?.planType,
+            codexErrorMessage: codexErrorMessage,
+            claudeErrorMessage: claudeErrorMessage,
+            statusLineMessage: statusLineMessage,
+            generalMessage: generalMessage
         )
     }
 
@@ -71,9 +85,16 @@ final class StatusBarController: NSObject, NSMenuDelegate {
         codexPoller.onError = { [weak self] message in
             self?.codexErrorMessage = message
             self?.refreshIcon()
+            self?.updateOpenMenuRows()
         }
         claudeWatcher.onUpdate = { [weak self] snapshot in
             self?.claudeSnapshot = snapshot
+            self?.claudeErrorMessage = nil
+            self?.refreshIcon()
+            self?.updateOpenMenuRows()
+        }
+        claudeWatcher.onError = { [weak self] message in
+            self?.claudeErrorMessage = message
             self?.refreshIcon()
             self?.updateOpenMenuRows()
         }
@@ -84,7 +105,22 @@ final class StatusBarController: NSObject, NSMenuDelegate {
         if Preferences.showCodex {
             codexPoller.start()
         }
+        let timer = Timer.scheduledTimer(withTimeInterval: 60, repeats: true) { [weak self] _ in
+            self?.refreshForTimePassage()
+        }
+        timer.tolerance = 5
+        freshnessTimer = timer
+        appearanceObservation = NSApp.observe(\.effectiveAppearance, options: [.new]) { [weak self] _, _ in
+            DispatchQueue.main.async {
+                self?.refreshIcon()
+            }
+        }
         refreshIcon()
+    }
+
+    deinit {
+        freshnessTimer?.invalidate()
+        codexPoller.shutdown()
     }
 
     private func startClaude() {
@@ -97,13 +133,55 @@ final class StatusBarController: NSObject, NSMenuDelegate {
     private func refreshIcon() {
         var entries: [MenuBarIconRenderer.Entry] = []
         if Preferences.showClaude {
-            entries.append(.init(label: "C", window: claudeSnapshot?.headline))
+            let state: MenuBarIconRenderer.DataState
+            if statusLineMessage != nil || claudeErrorMessage != nil {
+                state = .error
+            } else if let snapshot = claudeSnapshot {
+                state = snapshot.isStale ? .stale : .live
+            } else {
+                state = .missing
+            }
+            entries.append(.init(label: "C", window: claudeSnapshot?.headline, state: state))
         }
         if Preferences.showCodex {
-            entries.append(.init(label: "X", window: codexSnapshot?.headline))
+            let state: MenuBarIconRenderer.DataState
+            if codexErrorMessage != nil {
+                state = .error
+            } else if let snapshot = codexSnapshot {
+                state = snapshot.isStale ? .stale : .live
+            } else {
+                state = .missing
+            }
+            entries.append(.init(label: "X", window: codexSnapshot?.headline, state: state))
         }
         statusItem.length = MenuBarIconRenderer.iconWidth(entryCount: entries.count) + 4
-        statusItem.button?.image = MenuBarIconRenderer.render(entries: entries)
+        let image = MenuBarIconRenderer.render(entries: entries)
+        image.accessibilityDescription = "ClaudeとCodexのレート使用率"
+        statusItem.button?.image = image
+        statusItem.button?.setAccessibilityLabel("RateGadget")
+        statusItem.button?.setAccessibilityValue(accessibilitySummary())
+    }
+
+    private func refreshForTimePassage() {
+        refreshIcon()
+        if menuIsOpen {
+            rebuildWhenSafe()
+        }
+    }
+
+    private func accessibilitySummary() -> String {
+        var values: [String] = []
+        if Preferences.showClaude {
+            let value = formatPercent(claudeSnapshot?.headline?.usedPercent)
+            values.append(
+                "Claude \(value)\(claudeErrorMessage != nil || statusLineMessage != nil || claudeSnapshot?.isStale == true ? "、取得異常" : "")"
+            )
+        }
+        if Preferences.showCodex {
+            let value = formatPercent(codexSnapshot?.headline?.usedPercent)
+            values.append("Codex \(value)\(codexErrorMessage != nil || codexSnapshot?.isStale == true ? "、取得異常" : "")")
+        }
+        return values.isEmpty ? "すべて非表示" : values.joined(separator: "、")
     }
 
     /// Rebuilds the menu contents each time it is about to open, so the data
@@ -145,13 +223,15 @@ final class StatusBarController: NSObject, NSMenuDelegate {
                 let staleness = formatStaleness(snapshot.stalenessInterval)
                 let prefix = snapshot.isStale ? "⚠️ " : ""
                 menu.addItem(infoItem("\(prefix)最終更新 \(staleness)"))
-                menu.addItem(infoItem("Claude Code を操作すると更新されます"))
             } else {
                 menu.addItem(infoItem("データ未取得"))
-                menu.addItem(infoItem("Claude Code で一度やり取りすると表示されます"))
+                menu.addItem(infoItem("Claudeへ送信し、応答が完了すると最大5秒で表示されます"))
             }
             if let message = statusLineMessage {
                 menu.addItem(infoItem("⚠️ \(message)"))
+            }
+            if let error = claudeErrorMessage {
+                menu.addItem(infoItem("⚠️ \(error)"))
             }
         }
 
@@ -173,29 +253,41 @@ final class StatusBarController: NSObject, NSMenuDelegate {
             if let error = codexErrorMessage {
                 menu.addItem(infoItem("⚠️ \(error)"))
             }
+            if let snapshot = codexSnapshot {
+                let prefix = snapshot.isStale ? "⚠️ " : ""
+                menu.addItem(infoItem("\(prefix)最終取得 \(formatStaleness(snapshot.stalenessInterval))"))
+            } else if codexErrorMessage == nil {
+                menu.addItem(infoItem("データ未取得"))
+            }
         }
 
         if Preferences.showClaude || Preferences.showCodex {
             menu.addItem(.separator())
         }
 
-        let claudeToggleView = ToggleRowView(title: "Claude を表示", isOn: Preferences.showClaude)
-        claudeToggleView.onChange = { [weak self] isOn in
-            self?.setClaudeVisible(isOn)
-        }
-        let claudeToggle = NSMenuItem()
-        claudeToggle.view = claudeToggleView
+        let claudeToggle = NSMenuItem(
+            title: "Claude を表示",
+            action: #selector(toggleClaudeVisibility),
+            keyEquivalent: ""
+        )
+        claudeToggle.target = self
+        claudeToggle.state = Preferences.showClaude ? .on : .off
         claudeToggle.isEnabled = true
         menu.addItem(claudeToggle)
 
-        let codexToggleView = ToggleRowView(title: "Codex を表示", isOn: Preferences.showCodex)
-        codexToggleView.onChange = { [weak self] isOn in
-            self?.setCodexVisible(isOn)
-        }
-        let codexToggle = NSMenuItem()
-        codexToggle.view = codexToggleView
+        let codexToggle = NSMenuItem(
+            title: "Codex を表示",
+            action: #selector(toggleCodexVisibility),
+            keyEquivalent: ""
+        )
+        codexToggle.target = self
+        codexToggle.state = Preferences.showCodex ? .on : .off
         codexToggle.isEnabled = true
         menu.addItem(codexToggle)
+
+        if let generalMessage {
+            menu.addItem(infoItem("⚠️ \(generalMessage)"))
+        }
 
         menu.addItem(.separator())
 
@@ -215,7 +307,9 @@ final class StatusBarController: NSObject, NSMenuDelegate {
         .init(
             label: "5時間",
             window: claudeSnapshot?.fiveHour,
-            note: formatResetsAt(claudeSnapshot?.fiveHour?.resetsAt)
+            note: formatResetsAt(claudeSnapshot?.fiveHour?.resetsAt),
+            isStale: claudeSnapshot?.isStale ?? false,
+            hasError: claudeErrorMessage != nil || statusLineMessage != nil
         )
     }
 
@@ -223,7 +317,9 @@ final class StatusBarController: NSObject, NSMenuDelegate {
         .init(
             label: "週次",
             window: claudeSnapshot?.sevenDay,
-            note: formatResetsAt(claudeSnapshot?.sevenDay?.resetsAt)
+            note: formatResetsAt(claudeSnapshot?.sevenDay?.resetsAt),
+            isStale: claudeSnapshot?.isStale ?? false,
+            hasError: claudeErrorMessage != nil || statusLineMessage != nil
         )
     }
 
@@ -231,7 +327,9 @@ final class StatusBarController: NSObject, NSMenuDelegate {
         .init(
             label: codexSnapshot?.primary?.durationLabel ?? "primary",
             window: codexSnapshot?.primary,
-            note: formatResetsAt(codexSnapshot?.primary?.resetsAt)
+            note: formatResetsAt(codexSnapshot?.primary?.resetsAt),
+            isStale: codexSnapshot?.isStale ?? false,
+            hasError: codexErrorMessage != nil
         )
     }
 
@@ -239,7 +337,9 @@ final class StatusBarController: NSObject, NSMenuDelegate {
         .init(
             label: codexSnapshot?.secondary?.durationLabel ?? "secondary",
             window: codexSnapshot?.secondary,
-            note: formatResetsAt(codexSnapshot?.secondary?.resetsAt)
+            note: formatResetsAt(codexSnapshot?.secondary?.resetsAt),
+            isStale: codexSnapshot?.isStale ?? false,
+            hasError: codexErrorMessage != nil
         )
     }
 
@@ -280,26 +380,30 @@ final class StatusBarController: NSObject, NSMenuDelegate {
     }
 
     private func infoItem(_ text: String) -> NSMenuItem {
-        let item = NSMenuItem(title: text, action: nil, keyEquivalent: "")
+        let item = NSMenuItem()
         item.isEnabled = false
-        item.attributedTitle = NSAttributedString(
-            string: text,
-            attributes: [
-                .font: NSFont.systemFont(ofSize: 10),
-                .foregroundColor: NSColor.secondaryLabelColor,
-            ]
-        )
+        item.view = InfoRowView(text: text)
         return item
     }
 
     private func setClaudeVisible(_ visible: Bool) {
-        Preferences.showClaude = visible
         if visible {
+            Preferences.showClaude = true
+            generalMessage = nil
             startClaude()
         } else {
+            let result = StatusLineInstaller.uninstall()
+            guard !result.installed else {
+                generalMessage = result.message
+                scheduleMenuRebuild()
+                return
+            }
+            Preferences.showClaude = false
             claudeWatcher.stop()
             claudeSnapshot = nil
+            claudeErrorMessage = nil
             statusLineMessage = nil
+            generalMessage = nil
         }
         refreshIcon()
         scheduleMenuRebuild()
@@ -318,11 +422,15 @@ final class StatusBarController: NSObject, NSMenuDelegate {
         scheduleMenuRebuild()
     }
 
-    /// Restructures the (possibly open) menu. Deferred one runloop tick so the
-    /// ToggleRowView that triggered it isn't torn down while its own event
-    /// handler is still on the stack, and further postponed while any mouse
-    /// button is held — reshaping the menu mid-click would let the release
-    /// land on whichever item shifted under the cursor.
+    @objc private func toggleClaudeVisibility() {
+        setClaudeVisible(!Preferences.showClaude)
+    }
+
+    @objc private func toggleCodexVisibility() {
+        setCodexVisible(!Preferences.showCodex)
+    }
+
+    /// Defer menu mutation until the current AppKit menu event has completed.
     private func scheduleMenuRebuild() {
         DispatchQueue.main.async { [weak self] in
             self?.rebuildWhenSafe()
@@ -350,9 +458,19 @@ final class StatusBarController: NSObject, NSMenuDelegate {
             } else {
                 try SMAppService.mainApp.register()
             }
+            generalMessage = nil
         } catch {
             NSLog("[RateGadget] login item toggle failed: %@", error.localizedDescription)
+            generalMessage = "ログイン項目を変更できませんでした: \(error.localizedDescription)"
         }
+        scheduleMenuRebuild()
+    }
+
+    func shutdown() {
+        freshnessTimer?.invalidate()
+        freshnessTimer = nil
+        claudeWatcher.stop()
+        codexPoller.shutdown()
     }
 
     @objc private func quit() {

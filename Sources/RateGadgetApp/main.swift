@@ -1,0 +1,3 @@
+import RateGadgetCore
+
+RateGadgetApplication.run()

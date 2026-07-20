@@ -3,7 +3,13 @@ import AppKit
 /// Draws a single rounded-rect gauge bar (track + proportional fill) into the
 /// current graphics context. Shared by the menu-bar icon renderer and the
 /// dropdown detail rows so both look identical.
-func drawGaugeBar(in rect: NSRect, usedPercent: Int?, severity: Severity, trackColor: NSColor) {
+func drawGaugeBar(
+    in rect: NSRect,
+    usedPercent: Int?,
+    severity: Severity,
+    trackColor: NSColor,
+    fillOverride: NSColor? = nil
+) {
     let radius = rect.height / 2
     let trackPath = NSBezierPath(roundedRect: rect, xRadius: radius, yRadius: radius)
     trackColor.setFill()
@@ -19,7 +25,7 @@ func drawGaugeBar(in rect: NSRect, usedPercent: Int?, severity: Severity, trackC
 
     NSGraphicsContext.saveGraphicsState()
     trackPath.addClip()
-    fillColor(for: severity).setFill()
+    (fillOverride ?? fillColor(for: severity)).setFill()
     fillRect.fill()
     NSGraphicsContext.restoreGraphicsState()
 }
@@ -49,9 +55,17 @@ final class GaugeBarView: NSView {
 /// are visible: two stacked bars (Claude on top, Codex below), a single
 /// centered bar, or a fallback glyph when both are hidden.
 enum MenuBarIconRenderer {
+    enum DataState {
+        case live
+        case missing
+        case stale
+        case error
+    }
+
     struct Entry {
         var label: String
         var window: RateWindow?
+        var state: DataState
     }
 
     static func iconWidth(entryCount: Int) -> CGFloat {
@@ -79,7 +93,7 @@ enum MenuBarIconRenderer {
                 .font: NSFont.systemFont(ofSize: 8, weight: .semibold),
                 .foregroundColor: NSColor.labelColor,
             ]
-            let barX: CGFloat = 12
+            let barX: CGFloat = 16
             let barWidth = rect.width - barX - 2
             let rowHeight: CGFloat = 8
 
@@ -90,87 +104,38 @@ enum MenuBarIconRenderer {
                 } else {
                     y = index == 0 ? rect.height - rowHeight : 2
                 }
-                (entry.label as NSString).draw(at: NSPoint(x: 0, y: y - 1), withAttributes: labelAttrs)
+                let statusMark: String
+                let fillOverride: NSColor?
+                switch entry.state {
+                case .live:
+                    statusMark = ""
+                    fillOverride = nil
+                case .missing:
+                    statusMark = "·"
+                    fillOverride = nil
+                case .stale:
+                    statusMark = "!"
+                    fillOverride = .systemGray
+                case .error:
+                    statusMark = "!"
+                    fillOverride = .systemRed
+                }
+                ((entry.label + statusMark) as NSString).draw(
+                    at: NSPoint(x: 0, y: y - 1),
+                    withAttributes: labelAttrs
+                )
                 drawGaugeBar(
                     in: NSRect(x: barX, y: y, width: barWidth, height: 6),
                     usedPercent: entry.window?.usedPercent,
                     severity: entry.window?.severity ?? .ok,
-                    trackColor: NSColor.tertiaryLabelColor
+                    trackColor: NSColor.tertiaryLabelColor,
+                    fillOverride: fillOverride
                 )
             }
             return true
         }
         image.isTemplate = false
         return image
-    }
-}
-
-/// A "label + switch" row used inside the dropdown menu for the show/hide
-/// toggles. The switch is drawn by hand: an NSSwitch inside a menu renders in
-/// the inactive (gray) appearance, so its on-state accent color never shows.
-/// Custom drawing keeps the ON state clearly colored. Clicking anywhere on the
-/// row flips it, and the menu stays open (view-based items don't dismiss).
-final class ToggleRowView: NSView {
-    private var isOn: Bool
-    var onChange: ((Bool) -> Void)?
-
-    private let pillSize = NSSize(width: 32, height: 18)
-
-    init(title: String, isOn: Bool, width: CGFloat = 300, height: CGFloat = 28) {
-        self.isOn = isOn
-        super.init(frame: NSRect(x: 0, y: 0, width: width, height: height))
-
-        let label = NSTextField(labelWithString: title)
-        label.font = NSFont.systemFont(ofSize: 12)
-        label.sizeToFit()
-        label.frame.origin = NSPoint(x: 14, y: (height - label.frame.height) / 2)
-        addSubview(label)
-    }
-
-    required init?(coder: NSCoder) {
-        fatalError("init(coder:) has not been implemented")
-    }
-
-    override func draw(_ dirtyRect: NSRect) {
-        super.draw(dirtyRect)
-
-        let pillRect = NSRect(
-            x: bounds.width - pillSize.width - 14,
-            y: (bounds.height - pillSize.height) / 2,
-            width: pillSize.width,
-            height: pillSize.height
-        )
-        let radius = pillSize.height / 2
-        let pillPath = NSBezierPath(roundedRect: pillRect, xRadius: radius, yRadius: radius)
-        (isOn ? NSColor.controlAccentColor : NSColor.tertiaryLabelColor).setFill()
-        pillPath.fill()
-
-        let knobDiameter = pillSize.height - 4
-        let knobX = isOn
-            ? pillRect.maxX - knobDiameter - 2
-            : pillRect.minX + 2
-        let knobRect = NSRect(
-            x: knobX,
-            y: pillRect.minY + 2,
-            width: knobDiameter,
-            height: knobDiameter
-        )
-        NSColor.white.setFill()
-        NSBezierPath(ovalIn: knobRect).fill()
-    }
-
-    // Act on mouseUp, not mouseDown: flipping restructures the open menu, and
-    // if rows shift while the button is still held, the subsequent mouseUp
-    // would land on (and activate) whatever item moved under the cursor —
-    // e.g. 終了. Swallow mouseDown so menu tracking doesn't act on it either.
-    override func mouseDown(with event: NSEvent) {}
-
-    override func mouseUp(with event: NSEvent) {
-        let location = convert(event.locationInWindow, from: nil)
-        guard bounds.contains(location) else { return }
-        isOn.toggle()
-        needsDisplay = true
-        onChange?(isOn)
     }
 }
 
@@ -223,6 +188,8 @@ final class DetailRowView: NSView {
         var label: String
         var window: RateWindow?
         var note: String?
+        var isStale = false
+        var hasError = false
     }
 
     var content: Content {
@@ -265,7 +232,8 @@ final class DetailRowView: NSView {
             in: barRect,
             usedPercent: content.window?.usedPercent,
             severity: content.window?.severity ?? .ok,
-            trackColor: NSColor.tertiaryLabelColor
+            trackColor: NSColor.tertiaryLabelColor,
+            fillOverride: content.hasError ? .systemRed : (content.isStale ? .systemGray : nil)
         )
 
         let percentText = formatPercent(content.window?.usedPercent)
@@ -280,5 +248,47 @@ final class DetailRowView: NSView {
                 withAttributes: noteAttrs
             )
         }
+    }
+}
+
+/// Fixed-width, wrapping informational text. A plain NSMenuItem expands the
+/// entire menu to fit long paths and errors, which can make the menu wider than
+/// the screen.
+final class InfoRowView: NSView {
+    private static let width: CGFloat = 300
+    private static let horizontalPadding: CGFloat = 14
+
+    init(text: String) {
+        let textWidth = Self.width - Self.horizontalPadding * 2
+        let font = NSFont.systemFont(ofSize: 10)
+        let attributes: [NSAttributedString.Key: Any] = [.font: font]
+        let measured = (text as NSString).boundingRect(
+            with: NSSize(width: textWidth, height: 60),
+            options: [.usesLineFragmentOrigin, .usesFontLeading],
+            attributes: attributes
+        )
+        let height = min(66, max(20, ceil(measured.height) + 6))
+        super.init(frame: NSRect(x: 0, y: 0, width: Self.width, height: height))
+
+        let label = NSTextField(wrappingLabelWithString: text)
+        label.font = font
+        label.textColor = .secondaryLabelColor
+        label.maximumNumberOfLines = 3
+        label.lineBreakMode = .byTruncatingTail
+        label.frame = NSRect(
+            x: Self.horizontalPadding,
+            y: 3,
+            width: textWidth,
+            height: height - 6
+        )
+        label.toolTip = text
+        addSubview(label)
+        setAccessibilityElement(true)
+        setAccessibilityRole(.staticText)
+        setAccessibilityLabel(text)
+    }
+
+    required init?(coder: NSCoder) {
+        fatalError("init(coder:) has not been implemented")
     }
 }
